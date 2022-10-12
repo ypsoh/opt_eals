@@ -1,0 +1,10 @@
+bin
+lib
+eigen-3.3.9
+ml-20m
+msd
+*.zip
+*.err
+*.log
+*.out
+.vscode

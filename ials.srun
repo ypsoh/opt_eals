@@ -1,0 +1,48 @@
+#!/bin/bash
+
+#SBATCH --partition=fat   ### Partition (like a queue in PBS)
+#SBATCH --job-name=ials      ### Job Name
+#SBATCH --output=ials.out         ### File in which to store job output
+#SBATCH --error=ials.err           ### File in which to store job error messages
+#SBATCH --time=0-12:00:00           ### Wall clock time limit in Days-HH:MM:SS
+#SBATCH --mem=128G
+#SBATCH --nodes=1                   ### Number of nodes needed for the job
+#SBATCH --ntasks-per-node=1         ### Number of tasks to be launched per Node
+#SBATCH --cpus-per-task=56          ### Number of threads per task (OMP threads)
+#SBATCH --account=hpctensor         ### Account used for job submission
+
+make
+module load gcc/7.3
+# source /packages/intel/19/linux/pkg_bin/compilervars.sh -arch intel64 -platform linux
+
+export KMP_AFFINITY=granularity=fine,compact,1
+
+export OMP_NUM_THREADS=56
+./run_ialspp.sh
+./run_ials.sh
+./run_icd.sh
+
+export OMP_NUM_THREADS=28
+./run_ialspp.sh
+./run_ials.sh
+./run_icd.sh
+
+export OMP_NUM_THREADS=14
+./run_ialspp.sh
+./run_ials.sh
+./run_icd.sh
+
+export OMP_NUM_THREADS=8
+./run_ialspp.sh
+./run_ials.sh
+./run_icd.sh
+
+export OMP_NUM_THREADS=4
+./run_ialspp.sh
+./run_ials.sh
+./run_icd.sh
+
+export OMP_NUM_THREADS=1
+./run_ialspp.sh
+./run_ials.sh
+./run_icd.sh
