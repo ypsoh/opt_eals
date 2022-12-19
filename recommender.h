@@ -84,6 +84,8 @@ class Recommender {
  public:
   typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
       MatrixXf;
+  typedef Eigen::Matrix<float, Eigen::Dynamic, Eigen::Dynamic, Eigen::ColMajor>
+      MatrixColMajXf;
   typedef Eigen::VectorXf VectorXf;
 
   virtual ~Recommender() {}

@@ -1,21 +1,8 @@
-// Copyright 2022 The Google Research Authors.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 #include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <iostream>
+#include <sstream>
 #include <mutex>
 #include <numeric>
 #include <random>
@@ -25,7 +12,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include <sstream>
 
 #include "Eigen/Dense"
 #include "Eigen/Core"
@@ -33,43 +19,27 @@
 #include "recommender.h"
 
 const float ProjectScalar(
-    const SpVector& user_history,
-    const Recommender::VectorXf& user_embedding,
-    const Recommender::MatrixXf& item_embeddings,
-    const int emb_index,
-    const Recommender::VectorXf& prediction,
-    const Recommender::VectorXf& local_gramian,
-    const float reg, const float unobserved_weight) {
-
+  const SpVector& user_history,
+  const float user_embedding_el, const float item_embedding_el,
+  const int emb_index, // needed to access element in gram "matrix"
+  const Recommender::VectorXf& prediction,
+  const Recommender::VectorXf& local_gramian, // we need whole vector
+  const float reg, const float unobserved_weight) {
   assert(user_history.size() > 0);
 
-  // Do we need to refetch this?
-  float user_emb_coeff = user_embedding.coeff(emb_index);
-  
   double rhs = 0.0;
   double lhs = unobserved_weight * local_gramian.coeff(emb_index) + reg;
 
   for (const auto& item_and_rating_index : user_history) {
-    const int cp = item_and_rating_index.first;
-    const int rating_index = item_and_rating_index.second;
-    assert(cp < item_embeddings.rows());
-    assert(rating_index < prediction.size());
-    const float cp_v = item_embeddings.coeff(cp, emb_index);
-
-    // Assumes entry for non zero is 1.. is this ok?
-    const float residual = (prediction.coeff(rating_index) - 1.0);
-    rhs += residual * cp_v;
-    lhs += cp_v * cp_v;
+    continue;
   }
 
-  // add "prediction" for the unobserved items
-  rhs += unobserved_weight * local_gramian.dot(user_embedding);
-  // add the regularization.
-  rhs += reg * user_emb_coeff;
+  // rhs += unobserved_weight * local_gramian.dot(u
 
-  return user_emb_coeff - rhs / lhs;
+  return user_embedding_el - rhs / lhs;
 }
 
+// Inside Train
 class ICDRecommender : public Recommender {
  public:
   ICDRecommender(int embedding_dim, int num_users, int num_items, float reg,
@@ -81,7 +51,12 @@ class ICDRecommender : public Recommender {
     std::random_device rd{};
     std::mt19937 gen{rd()};
     std::normal_distribution<float> d(0, adjusted_stdev);
-    auto init_matrix = [&](Recommender::MatrixXf* matrix) {
+    // auto init_matrix = [&](Recommender::MatrixXf* matrix) {
+    //   for (int i = 0; i < matrix->size(); ++i) {
+    //     *(matrix->data() + i) = d(gen);
+    //   }
+    // };
+    auto init_matrix = [&](Recommender::MatrixColMajXf* matrix) {
       for (int i = 0; i < matrix->size(); ++i) {
         *(matrix->data() + i) = d(gen);
       }
@@ -94,6 +69,46 @@ class ICDRecommender : public Recommender {
     embedding_dim_ = embedding_dim;
     unobserved_weight_ = unobserved_weight;
   }
+
+  float UpdateUserOrItemByColumn(
+    const SpVector& history,
+    const float user_embedding_el,
+    const VectorXf get_item_embedding_col,
+    const int f,
+    VectorXf * prediction,
+    const VectorXf& gramian, // f-th row of item gramian
+    const float unobserved_items, //
+    const float reg, const float unobserved_weight
+  ) {
+
+    double rhs = 1.0;
+    double lhs = 0.1;
+
+    // double rhs = 0.0;
+    // double lhs = unobserved_weight * gramian.coeff(f) + reg;
+
+    // for (const auto& item_and_rating_index : history) {
+    //   const int cp = item_and_rating_index.first;
+    //   const int rating_index = item_and_rating_index.second;
+    //   const float cp_v = get_item_embedding_col.coeff(cp);
+    //   const float residual = prediction->coeff(rating_index) - 1.0;
+    //   rhs += residual * cp_v;
+    //   lhs += cp_v * cp_v;
+    // }
+
+    // rhs += unobserved_weight * unobserved_items;
+    // rhs += reg * user_embedding_el;
+
+    // float delta = rhs / lhs;
+
+    // Update prediction
+    // for (const auto& item_and_rating_index : history) {
+    //   prediction->coeffRef(item_and_rating_index.second) +=
+    //   delta * get_item_embedding_col.coeff(item_and_rating_index.first);
+    // }
+    return user_embedding_el - rhs / lhs;
+  }
+
 
   VectorXf Score(const int user_id, const SpVector& user_history) override {
     throw("Function 'Score' is not implemented");
@@ -125,7 +140,7 @@ class ICDRecommender : public Recommender {
         const VectorXf& user_emb = user_to_emb[user_and_history.first];
         for (const auto& item_and_rating_index : user_and_history.second) {
           prediction.coeffRef(item_and_rating_index.second) =
-              item_embedding_.row(item_and_rating_index.first).dot(user_emb);
+              item_embedding_.transpose().col(item_and_rating_index.first).dot(user_emb);
         }
       }
 
@@ -153,49 +168,183 @@ class ICDRecommender : public Recommender {
 
   void Train(const Dataset& data) override {
     auto prediction_start = std::chrono::steady_clock::now();
+    printf("starting prediction\n");
 
     // Predict the dataset.
     VectorXf prediction(data.num_tuples());
-    for (const auto& user_and_history : data.by_user()) {
-      VectorXf user_emb = user_embedding_.row(user_and_history.first);
-      for (const auto& item_and_rating_index : user_and_history.second) {
-        prediction.coeffRef(item_and_rating_index.second) =
-            item_embedding_.row(item_and_rating_index.first).dot(user_emb);
-      }
-    }
+    // user_embedding_.transposeInPlace();
+    // item_embedding_.transposeInPlace();
 
+    // for (const auto& user_and_history : data.by_user()) {
+    //   VectorXf user_emb = user_embedding_.col(user_and_history.first);
+    //   for (const auto& item_and_rating_index : user_and_history.second) {
+    //     prediction.coeffRef(item_and_rating_index.second) =
+    //         item_embedding_.col(item_and_rating_index.first).dot(user_emb);
+    //   }
+    // }
+    // user_embedding_.transposeInPlace();
+    // item_embedding_.transposeInPlace();
+
+    printf("done prediction\n");
     auto prediction_end = std::chrono::steady_clock::now();
+
+    // Compute item_gramian = I.T * I
+    MatrixXf item_gramian = item_embedding_.transpose() * item_embedding_;
+
+    // user_embedding_dot_item_gramian.col
+    // Compute prod user_embedding * item_gramian
+    // Feed f-th column of prod to each step
+    // Each Step computes the f-th factor update for user and item
+
+    int num_threads = std::atoi(std::getenv("OMP_NUM_THREADS"));
+    // int num_threads = 1;
+    std::cout << "ICD -- num threads:" << num_threads << std::endl;
+
     auto user_update_start = std::chrono::steady_clock::now();
 
-    for (int start = 0; start < embedding_dim_; ++start) {
-      assert(start < embedding_dim_);
-      int end = std::min(start + 1, embedding_dim_);
+    for (int f = 0; f < embedding_dim_; ++f) {
+      printf("Starting updating factor %d\n", f);
+      // Start timer
 
-      Step(data.by_user(), start, end, &prediction,
-          [&](const int index) -> MatrixXf::RowXpr {
-            return user_embedding_.row(index);
-          },
-          item_embedding_,
-          /*index_of_item_bias=*/1);
+      // User embedding is updated after a single factor is completed updating
+      MatrixColMajXf user_embedding_dot_item_gramian = user_embedding_ * item_gramian;
+      VectorXf local_user_embedding_dot_item_gramian = user_embedding_dot_item_gramian.col(f);
+
+      auto user_embedding_f = user_embedding_.col(f);
+      auto item_embedding_f = item_embedding_.col(f);
+/*
+        std::vector<std::thread> threads(num_threads);
+
+        for (int i = 0; i < num_threads; ++i) {
+          threads[i] = std::thread([&]{
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(i, &cpuset);
+            int rc = pthread_setaffinity_np(
+              threads[i].native_handle(),
+              sizeof(cpu_set_t), &cpuset);
+            if (rc != 0) {
+              std::cerr << "Error calling pthread_set_affinity_np: " << rc << "\n";
+            }
+
+            while(true) {
+              m.lock();
+              if (data_by_user_iter == data.by_user().end()) {
+                m.unlock();
+                return;
+              }
+              int u = data_by_user_iter->first;
+              SpVector train_history = data_by_user_iter->second;
+              ++data_by_user_iter;
+              m.unlock();
+
+              //TODO: Update
+              const float reg = RegularizationValue(train_history.size(), num_items);
+              const float unobserved_weight = this->unobserved_weight_;
+
+              float new_user_embedding_el = UpdateUserOrItemByColumn(
+                train_history,
+                user_embedding_f.coeff(u), // we know the user
+                item_embedding_f, // f-th item column
+                f,
+                &prediction,
+                item_gramian.row(f),
+                local_user_embedding_dot_item_gramian.coeff(u),
+                reg, unobserved_weight
+              );
+
+              user_embedding_.coeffRef(u, f) = new_user_embedding_el;
+            }
+          });
+        }
+*/
+
+      int num_items = item_embedding_.rows();
+
+        std::mutex m;
+        auto data_by_user_iter = data.by_user().begin();
+        std::vector<std::thread> threads(num_threads);
+
+        for (int i = 0; i < threads.size(); ++i) {
+          threads[i] = (std::thread([&, i]{
+            // cpu_set_t cpuset;
+            // CPU_ZERO(&cpuset);
+            // CPU_SET(i, &cpuset);
+            // int rc = pthread_setaffinity_np(
+            //   threads[i].native_handle(),
+            //   sizeof(cpu_set_t), &cpuset);
+            // if (rc != 0) {
+            //   std::cerr << "Error calling pthread_set_affinity_np: " << rc << "\n";
+            // }
+
+            while(true) {
+              // std::stringstream stream;
+              // stream << "Thread #" << i << ": on CPU " << sched_getcpu() << "\n";
+              // std::cout << stream.str();
+
+              // std::this_thread::sleep_for(std::chrono::milliseconds(900));
+
+              m.lock();
+              if (data_by_user_iter == data.by_user().end()) {
+                m.unlock();
+                return;
+              }
+              int u = data_by_user_iter->first;
+              SpVector train_history = data_by_user_iter->second;
+              ++data_by_user_iter;
+              m.unlock();
+              // int u = 1;
+              //TODO: Update
+              const float reg = RegularizationValue(train_history.size(), num_items);
+              const float unobserved_weight = this->unobserved_weight_;
+
+              float new_user_embedding_el = UpdateUserOrItemByColumn(
+                train_history,
+                user_embedding_f.coeff(u), // we know the user
+                item_embedding_f, // f-th item column
+                f,
+                &prediction,
+                item_gramian.row(f),
+                local_user_embedding_dot_item_gramian.coeff(u),
+                reg, unobserved_weight
+              );
+
+              // m.lock();
+              user_embedding_.coeffRef(u, f) = new_user_embedding_el;
+              // user_embedding_.coeffRef(u, f) = 0.314;
+              // m.unlock();
+              // std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
+            }
+          }));
+        }
+        // Join all threads.
+        for (int i = 0; i < threads.size(); ++i) {
+          threads[i].join();
+        }
+
+      // printf("Completed updating factor %d\n", f);
     }
-
     auto user_update_end = std::chrono::steady_clock::now();
+
     printf("User update: %d\n",
       std::chrono::duration_cast<std::chrono::milliseconds>(
         user_update_end- user_update_start));
+    printf("training complete\n");
     ComputeLosses(data, prediction);
 
+    MatrixXf user_gramian = user_embedding_.transpose() * user_embedding_;
+
+
     for (int start = 0; start < embedding_dim_; ++start) {
-      assert(start < embedding_dim_);
-      int end = std::min(start + 1, embedding_dim_);
 
       // Optimize the item embeddings
-      Step(data.by_item(), start, end, &prediction,
-          [&](const int index) -> MatrixXf::RowXpr {
-            return item_embedding_.row(index);
-          },
-          user_embedding_,
-          /*index_of_item_bias=*/0);
+      // Step(data.by_item(), start, end, &prediction,
+      //     [&](const int index) -> MatrixXf::RowXpr {
+      //       return item_embedding_.row(index);
+      //     },
+      //     user_embedding_,
+      //     /*index_of_item_bias=*/0);
     }
     ComputeLosses(data, prediction);
 
@@ -275,23 +424,10 @@ class ICDRecommender : public Recommender {
     // int num_threads = std::thread::hardware_concurrency();
     int num_threads = std::atoi(std::getenv("OMP_NUM_THREADS"));
 
-    std::vector<std::thread> threads(num_threads);
+    std::vector<std::thread> threads;
     for (int i = 0; i < num_threads; ++i) {
-      threads[i] = (std::thread([&, i]{
-        // cpu_set_t cpuset;
-        // CPU_ZERO(&cpuset);
-        // CPU_SET(i, &cpuset);
-        // int rc = pthread_setaffinity_np(
-        //   threads[i].native_handle(),
-        //   sizeof(cpu_set_t), &cpuset);
-        // if (rc != 0) {
-        //   std::cerr << "Error calling pthread_set_affinity_np: " << rc << "\n";
-        // }
-
+      threads.emplace_back(std::thread([&]{
         while (true) {
-          std::stringstream stream;
-          stream << "Thread #" << i << ": on CPU " << sched_getcpu() << "\n";
-          std::cout << stream.str();
           // Get a new user to work on.
           m.lock();
           if (data_by_user_iter == data_by_user.end()) {
@@ -309,8 +445,8 @@ class ICDRecommender : public Recommender {
           float old_local_user_emb = old_user_emb[block_start];
           float new_local_user_emb = ProjectScalar(
               train_history,
-              old_user_emb,
-              item_embedding,
+              old_user_emb(block_start),
+              item_embedding(block_start),
               block_start,
               *prediction,
               local_gramian,
@@ -329,52 +465,6 @@ class ICDRecommender : public Recommender {
         }
       }));
     }
-
-
-    // std::vector<std::thread> threads;
-    // for (int i = 0; i < num_threads; ++i) {
-    //   threads.emplace_back(std::thread([&]{
-    //     while (true) {
-    //       std::stringstream stream;
-    //       stream << "Thread #" << i << ": on CPU " << sched_getcpu() << "\n";
-    //       std::cout << stream.str();
-    //       // Get a new user to work on.
-    //       m.lock();
-    //       if (data_by_user_iter == data_by_user.end()) {
-    //         m.unlock();
-    //         return;
-    //       }
-    //       int u = data_by_user_iter->first;
-    //       SpVector train_history = data_by_user_iter->second;
-    //       ++data_by_user_iter;
-    //       m.unlock();
-
-    //       assert(!train_history.empty());
-    //       float reg = RegularizationValue(train_history.size(), num_items);
-    //       VectorXf old_user_emb = get_user_embedding_ref(u);
-    //       float old_local_user_emb = old_user_emb[block_start];
-    //       float new_local_user_emb = ProjectScalar(
-    //           train_history,
-    //           old_user_emb,
-    //           item_embedding,
-    //           block_start,
-    //           *prediction,
-    //           local_gramian,
-    //           reg, this->unobserved_weight_);
-    //       // Update the ratings (without a lock)
-    //       float delta = new_local_user_emb - old_user_emb.coeff(block_start);
-    //       for (const auto& item_and_rating_index : train_history) {
-    //         prediction->coeffRef(item_and_rating_index.second) +=
-    //             delta * item_embedding.coeff(item_and_rating_index.first,
-    //                                          block_start);
-    //       }
-    //       // Update the user embedding.
-    //       m.lock();
-    //       get_user_embedding_ref(u).coeffRef(block_start) = new_local_user_emb;
-    //       m.unlock();
-    //     }
-    //   }));
-    // }
     // Join all threads.
     for (int i = 0; i < threads.size(); ++i) {
       threads[i].join();
@@ -388,8 +478,8 @@ class ICDRecommender : public Recommender {
   }
 
  private:
-  MatrixXf user_embedding_;
-  MatrixXf item_embedding_;
+  MatrixColMajXf user_embedding_;
+  MatrixColMajXf item_embedding_;
 
   float regularization_;
   float regularization_exp_;
@@ -409,7 +499,7 @@ int main(int argc, char* argv[]) {
   flags["regularization_exp"] = "1.0";
   flags["stddev"] = "0.1";
   flags["print_train_stats"] = "0";
-  flags["eval_during_training"] = "1";
+  flags["eval_during_training"] = "0";
 
   // Parse flags. This is a simple implementation to avoid external
   // dependencies.
@@ -449,7 +539,6 @@ int main(int argc, char* argv[]) {
     std::atof(flags.at("stddev").c_str()));
   ((ICDRecommender*)recommender)->SetPrintTrainStats(
       std::atoi(flags.at("print_train_stats").c_str()));
-
   // Disable output buffer to see results without delay.
   setbuf(stdout, NULL);
 
@@ -468,7 +557,6 @@ int main(int argc, char* argv[]) {
   if (eval_during_training) {
     evaluate(0);
   }
-  std::cout << "ICD -- num threads:" << std::atoi(std::getenv("OMP_NUM_THREADS")) << std::endl;
 
   // Train and evaluate.
   int num_epochs = std::atoi(flags.at("epochs").c_str());

@@ -25,6 +25,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <omp.h>
 
 #include "Eigen/Dense"
 #include "Eigen/Core"
@@ -33,20 +34,6 @@
 
 // Do an elementwise update but do it in a vectorized fashion
 // where we update over entire embedding space
-const float VectorizedProjectScalar(
-    const SpVector& user_history,
-    const Recommender::VectorXf& user_embedding,
-    const Recommender::MatrixXf& item_embeddings,
-    const Recommender::VectorXf& prediction,
-    const Recommender::VectorXf& local_gramian,
-    const float reg, const float unobserved_weight) {
-
-  assert(user_history.size() > 0);
-
-  VectorXf rhs;
-  VectorXf lhs = unobserved_weight * local_gramian + reg;
-  
-}
 
 const float ProjectScalar(
     const SpVector& user_history,
@@ -85,6 +72,7 @@ const float ProjectScalar(
 
   return user_emb_coeff - rhs / lhs;
 }
+
 
 class ICDRecommender : public Recommender {
  public:
@@ -170,6 +158,41 @@ class ICDRecommender : public Recommender {
         });
   }
 
+  template <typename F>
+  void UpdateUserOrItem(
+    int index,
+    F get_user_embedding_ref,
+    // Recommender::VectorXf& user_embedding,
+    SpVector& train_history,
+    const Recommender::MatrixXf& item_embeddings,
+    const Recommender::MatrixXf& local_gramian,
+    VectorXf * prediction) {
+
+    int num_items = item_embeddings.rows();
+    float reg = RegularizationValue(train_history.size(), num_items);
+
+
+    for (int i = 0; i < embedding_dim_; ++i) {
+      VectorXf old_user_emb = get_user_embedding_ref(index);
+      float new_local_user_emb = ProjectScalar(
+        train_history,
+        old_user_emb,
+        item_embeddings,
+        i, // Block start
+        *prediction,
+        local_gramian.row(i),
+        reg, this->unobserved_weight_);
+      float delta = new_local_user_emb - old_user_emb.coeff(i);
+
+      for (const auto& item_and_rating_index : train_history) {
+        prediction->coeffRef(item_and_rating_index.second) +=
+        delta * item_embeddings.coeff(item_and_rating_index.first, i);
+      }
+      get_user_embedding_ref(index).coeffRef(i) = new_local_user_emb;
+    }
+
+  }
+
   void Train(const Dataset& data) override {
     auto prediction_start = std::chrono::steady_clock::now();
 
@@ -191,38 +214,104 @@ class ICDRecommender : public Recommender {
     // Iterate over user -- not embedding_dim_
     // This will eliminate the need to lock any users..?
 
+    // Iterate over every user
+    std::mutex m;
+    int num_threads = std::atoi(std::getenv("OMP_NUM_THREADS")) ? std::atoi(std::getenv("OMP_NUM_THREADS")) : 56;
+    std::cout << "ICD -- num threads:" << std::atoi(std::getenv("OMP_NUM_THREADS")) << std::endl;
 
-    for (int start = 0; start < embedding_dim_; ++start) {
-      assert(start < embedding_dim_);
-      int end = std::min(start + 1, embedding_dim_);
+    auto user_update_start = std::chrono::steady_clock::now();
 
-      Step(data.by_user(), start, end, &prediction,
-          [&](const int index) -> MatrixXf::RowXpr {
-            return user_embedding_.row(index);
-          },
-          item_embedding_,
-          item_gramian,
-          /*index_of_item_bias=*/1);
-      ComputeLosses(data, prediction);
+    { /// Update user
+      auto data_by_user_iter = data.by_user().begin();
+      std::vector<std::thread> threads;
+
+      for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(std::thread([&]{
+          while (true) {
+            m.lock();
+            if (data_by_user_iter == data.by_user().end()) {
+              m.unlock();
+              return;
+            }
+            int u = data_by_user_iter->first;
+            SpVector train_history = data_by_user_iter->second;
+            ++data_by_user_iter;
+            m.unlock();
+
+            // Get old_user_emb
+            VectorXf old_user_emb = user_embedding_.row(u);
+            assert(!train_history.empty());
+            UpdateUserOrItem(
+              u,
+              [&](const int index) -> MatrixXf::RowXpr  {
+                return user_embedding_.row(index);
+              },
+              train_history,
+              item_embedding_,
+              item_gramian,
+              &prediction // VectorXf
+              );
+          }
+        }));
+      }
+      for (int i = 0; i < threads.size(); ++i) {
+        threads[i].join();
+      }
     }
+    auto user_update_end = std::chrono::steady_clock::now();
+    printf("User update: %d\n",
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        user_update_end- user_update_start));
 
-    // Compute user gramian for item update
+    ComputeLosses(data, prediction);
     MatrixXf user_gramian = user_embedding_.transpose() * user_embedding_;
 
-    for (int start = 0; start < embedding_dim_; ++start) {
-      assert(start < embedding_dim_);
-      int end = std::min(start + 1, embedding_dim_);
+    auto item_update_start = std::chrono::steady_clock::now();
 
-      // Optimize the item embeddings
-      Step(data.by_item(), start, end, &prediction,
-          [&](const int index) -> MatrixXf::RowXpr {
-            return item_embedding_.row(index);
-          },
-          user_embedding_,
-          user_gramian,
-          /*index_of_item_bias=*/0);
-      ComputeLosses(data, prediction);
+    { /// Update item
+      auto data_by_item_iter = data.by_item().begin();
+      std::vector<std::thread> threads;
+
+      for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(std::thread([&]{
+          while (true) {
+            m.lock();
+            if (data_by_item_iter == data.by_item().end()) {
+              m.unlock();
+              return;
+            }
+            int u = data_by_item_iter->first;
+            SpVector train_history = data_by_item_iter->second;
+            ++data_by_item_iter;
+            m.unlock();
+
+            // Get old_item_emb
+            VectorXf old_item_emb = item_embedding_.row(u);
+            assert(!train_history.empty());
+            UpdateUserOrItem(
+              u,
+              [&](const int index) -> MatrixXf::RowXpr  {
+                return item_embedding_.row(index);
+              },
+              train_history,
+              user_embedding_,
+              user_gramian,
+              &prediction // VectorXf
+              );
+          }
+        }));
+      }
+      for (int i = 0; i < threads.size(); ++i) {
+        threads[i].join();
+      }
     }
+    auto item_update_end = std::chrono::steady_clock::now();
+
+    printf("Item update: %d\n",
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        item_update_end- item_update_start));
+
+    ComputeLosses(data, prediction);
 
     auto als_step_end = std::chrono::steady_clock::now();
 
@@ -378,7 +467,7 @@ int main(int argc, char* argv[]) {
   flags["regularization_exp"] = "1.0";
   flags["stddev"] = "0.1";
   flags["print_train_stats"] = "0";
-  flags["eval_during_training"] = "1";
+  flags["eval_during_training"] = "0";
 
   // Parse flags. This is a simple implementation to avoid external
   // dependencies.
@@ -426,7 +515,7 @@ int main(int argc, char* argv[]) {
   auto evaluate = [&](int epoch) {
     Recommender::VectorXf metrics =
         recommender->EvaluateDataset(test_tr, test_te.by_user());
-    printf("Epoch %4d:\t Rec20=%.4f, Rec50=%.4f NDCG100=%.4f\n",
+    printf("Epoch %4d:\t Rec20\t%.4f, Rec50\t%.4f NDCG100\t%.4f\n",
            epoch, metrics[0], metrics[1], metrics[2]);
   };
 
@@ -437,7 +526,6 @@ int main(int argc, char* argv[]) {
   if (eval_during_training) {
     evaluate(0);
   }
-  std::cout << "ICD -- num threads:" << std::atoi(std::getenv("OMP_NUM_THREADS")) << std::endl;
 
   // Train and evaluate.
   int num_epochs = std::atoi(flags.at("epochs").c_str());
@@ -450,11 +538,11 @@ int main(int argc, char* argv[]) {
       evaluate(epoch + 1);
     }
     auto time_eval_end = std::chrono::steady_clock::now();
-    // printf("Timer: Train=%d\tEval=%d\n",
-    //        std::chrono::duration_cast<std::chrono::milliseconds>(
-    //            time_train_end - time_train_start),
-    //        std::chrono::duration_cast<std::chrono::milliseconds>(
-    //            time_eval_end - time_eval_start));
+    printf("Timer: Train=%d\tEval=%d\n",
+           std::chrono::duration_cast<std::chrono::milliseconds>(
+               time_train_end - time_train_start),
+           std::chrono::duration_cast<std::chrono::milliseconds>(
+               time_eval_end - time_eval_start));
   }
   if (!eval_during_training) {
     evaluate(num_epochs);

@@ -461,7 +461,7 @@ int main(int argc, char* argv[]) {
   auto evaluate = [&](int epoch) {
     Recommender::VectorXf metrics =
         recommender->EvaluateDataset(test_tr, test_te.by_user());
-    printf("Epoch %4d:\t Rec20=%.4f, Rec50=%.4f NDCG100=%.4f\n",
+    printf("Epoch %4d:\t Rec20\t%.4f, Rec50\t%.4f NDCG100\t%.4f\n",
            epoch, metrics[0], metrics[1], metrics[2]);
   };
 
