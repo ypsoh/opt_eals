@@ -1,8 +1,8 @@
-CFLAGS = -std=c++11 -O3 -Wall -lpthread -march=native -fopenmp
+CFLAGS = -std=c++11 -O3 -Wpedantic -lpthread -march=native -fopenmp
 #CFLAGS = -std=c++11 -O0 -Wall -lpthread -march=native -fopenmp
 
 # all: ialspp_main ials_main icd_main popularity_main
-all: icd_main icd_main_opt
+all: icd_main icd_main_opt icd_opt_main
 
 ialspp_main: ialspp_main.cc
 	g++ -pthread -I eigen-3.3.9 ${CFLAGS} -c ialspp_main.cc -o lib/ialspp_main.o
@@ -19,6 +19,10 @@ icd_main: icd_main.cc
 icd_main_opt: icd_main_opt.cc
 	g++ -pthread -g -I eigen-3.3.9 ${CFLAGS} -c icd_main_opt.cc -o lib/icd_main_opt.o
 	g++ -pthread -g ${CFLAGS} lib/icd_main_opt.o -o bin/icd_main_opt
+
+icd_opt_main: icd_main_opt.cc
+	g++ -pthread -g -I eigen-3.3.9 ${CFLAGS} -c icd_opt_main.cc -o lib/icd_opt_main.o
+	g++ -pthread -g ${CFLAGS} lib/icd_opt_main.o -o bin/icd_opt_main
 
 icd_col_main: icd_col_main.cc
 	g++ -pthread -g -I eigen-3.3.9 ${CFLAGS} -c icd_col_main.cc -o lib/icd_col_main.o
