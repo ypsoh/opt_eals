@@ -1,21 +1,29 @@
 #!/bin/bash
 module load gcc/7.3
-export OMP_NUM_THREADS=56
 
-if make ials_main
-then
-    echo "Good build"
-    ./bin/ials_main   --train_data ml-20m/train.csv \
-        --test_train_data ml-20m/test_tr.csv \
-        --test_test_data ml-20m/test_te.csv \
-        --embedding_dim 256 \
-        --stddev 0.1 \
-        --regularization 0.003 \
-        --regularization_exp 1.0 \
-        --unobserved_weight 0.1  \
-        --epochs 10 --block_size 64 --eval_during_training 1
-else
-    echo "Bad build"
-    exit 1
-fi
+# Compact params
+num_threads="56"
+embedding_size="256"
+epochs="1"
+models="ials_main ialspp_main"
+datasets="ml-20m"
 
+# Extended params
+# num_threads="1 4 8 14 28 56"
+# embedding_size="64 128 256 512 1024 2048"
+# epochs="1 4 8"
+# models="ials_main ialspp_main icd_main icd_merged_main"
+# datasets="ml-20m msd"
+
+# We don't variate block size yet -- this only affects iALSpp
+for dataset in $datasets; do
+    for num_thread in $num_threads; do
+        for emb in $embedding_size; do
+            for model in $models; do
+                for epoch in $epochs; do
+                    ./run.sh -m $model -d $dataset -t $num_thread -f $emb -e $epoch -b 64 2>&1
+                done
+            done
+        done
+    done
+done
