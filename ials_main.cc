@@ -58,10 +58,7 @@ const Recommender::VectorXf Project(
   Eigen::MatrixXf factor_batch(embedding_dim, batch_size);
   for (const auto& item_and_rating_index : user_history) {
     const int cp = item_and_rating_index.first;
-    // cp: item index
     assert(cp < item_embeddings.rows());
-
-    // item embedding
     const Recommender::VectorXf cp_v = item_embeddings.row(cp);
 
     factor_batch.col(num_batched) = cp_v;
@@ -69,7 +66,6 @@ const Recommender::VectorXf Project(
 
     ++num_batched;
     if (num_batched == batch_size) {
-      // computes gram matrix for non zero user/item pairs
       matrix_symm.rankUpdate(factor_batch);
       num_batched = 0;
     }
@@ -147,9 +143,6 @@ class IALSRecommender : public Recommender {
   }
 
   void Train(const Dataset& data) override {
-    auto prediction_start = std::chrono::steady_clock::now();
-    auto prediction_end = std::chrono::steady_clock::now();
-
     Step(data.by_user(),
         [&](const int index) -> MatrixXf::RowXpr {
           return user_embedding_.row(index);
@@ -166,14 +159,6 @@ class IALSRecommender : public Recommender {
         user_embedding_,
         /*index_of_item_bias=*/0);
     ComputeLosses(data);
-
-    auto als_step_end = std::chrono::steady_clock::now();
-
-    printf("Inner train: Prediction=%d\tStep=%d\n",
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-        prediction_end - prediction_start),
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-        als_step_end - prediction_end));
   }
 
   void ComputeLosses(const Dataset& data) {
@@ -244,10 +229,7 @@ class IALSRecommender : public Recommender {
 
     std::mutex m;
     auto data_by_user_iter = data_by_user.begin();  // protected by m
-    
-    // int num_threads = std::thread::hardware_concurrency();
-    int num_threads = std::atoi(std::getenv("OMP_NUM_THREADS"));
-    
+    int num_threads = std::thread::hardware_concurrency();
     std::vector<std::thread> threads;
     for (int i = 0; i < num_threads; ++i) {
       threads.emplace_back(std::thread([&]{
@@ -370,7 +352,6 @@ int main(int argc, char* argv[]) {
   if (eval_during_training) {
     evaluate(0);
   }
-  std::cout << "IALS -- num threads:" << std::atoi(std::getenv("OMP_NUM_THREADS")) << std::endl;
 
   // Train and evaluate.
   int num_epochs = std::atoi(flags.at("epochs").c_str());
@@ -383,11 +364,11 @@ int main(int argc, char* argv[]) {
       evaluate(epoch + 1);
     }
     auto time_eval_end = std::chrono::steady_clock::now();
-    // printf("Timer: Train=%d\tEval=%d\n",
-    //        std::chrono::duration_cast<std::chrono::milliseconds>(
-    //            time_train_end - time_train_start),
-    //        std::chrono::duration_cast<std::chrono::milliseconds>(
-    //            time_eval_end - time_eval_start));
+    printf("Timer: Train=%d\tEval=%d\n",
+           std::chrono::duration_cast<std::chrono::milliseconds>(
+               time_train_end - time_train_start),
+           std::chrono::duration_cast<std::chrono::milliseconds>(
+               time_eval_end - time_eval_start));
   }
   if (!eval_during_training) {
     evaluate(num_epochs);

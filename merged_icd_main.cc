@@ -25,81 +25,61 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <sstream>
 
 #include "Eigen/Dense"
 #include "Eigen/Core"
 
 #include "recommender.h"
+#define TIMER 0
 
-const Recommender::VectorXf ProjectBlock(
+const float ProjectScalar(
     const SpVector& user_history,
     const Recommender::VectorXf& user_embedding,
-    const Recommender::VectorXf& local_user_embedding,
-    const Recommender::MatrixXf& local_item_embedding,
-    const Recommender::VectorXf& prediction,
-    const Recommender::MatrixXf& local_gramian,
-    const Recommender::MatrixXf& local_global_gramian,
+    const Recommender::MatrixXf& item_embeddings,
+    const int emb_index,
+    Recommender::VectorXf& prediction,
+    const Recommender::VectorXf& local_gramian,
     const float reg, const float unobserved_weight) {
+
   assert(user_history.size() > 0);
-  int local_embedding_dim = local_item_embedding.cols();
-  assert(local_embedding_dim > 0);
 
-  Recommender::VectorXf new_value(local_embedding_dim);
+  // Do we need to refetch this?
+  float user_emb_coeff = user_embedding.coeff(emb_index);
+  
+  double rhs = 0.0;
+  double lhs = unobserved_weight * local_gramian.coeff(emb_index) + reg;
 
-  Eigen::MatrixXf matrix = unobserved_weight * local_gramian;
-
-  for (int i = 0; i < local_embedding_dim; ++i) {
-    matrix(i, i) += reg;
-  }
-
-  const int kMaxBatchSize = 128;
-  auto matrix_symm = matrix.selfadjointView<Eigen::Lower>();
-  Eigen::VectorXf rhs = Eigen::VectorXf::Zero(local_embedding_dim);
-  const int batch_size = std::min(static_cast<int>(user_history.size()),
-                                  kMaxBatchSize);
-  int num_batched = 0;
-  Eigen::MatrixXf factor_batch(local_embedding_dim, batch_size);
   for (const auto& item_and_rating_index : user_history) {
     const int cp = item_and_rating_index.first;
     const int rating_index = item_and_rating_index.second;
-    assert(cp < local_item_embedding.rows());
+    assert(cp < item_embeddings.rows());
     assert(rating_index < prediction.size());
-    const Recommender::VectorXf cp_v = local_item_embedding.row(cp);
+    const float cp_v = item_embeddings.coeff(cp, emb_index);
 
+    // Assumes entry for non zero is 1.. is this ok?
     const float residual = (prediction.coeff(rating_index) - 1.0);
-
-    factor_batch.col(num_batched) = cp_v;
-    rhs += cp_v * residual;
-
-    ++num_batched;
-    if (num_batched == batch_size) {
-      matrix_symm.rankUpdate(factor_batch);
-      num_batched = 0;
-    }
-  }
-  if (num_batched != 0) {
-    auto factor_block = factor_batch.block(
-        0, 0, local_embedding_dim, num_batched);
-    matrix_symm.rankUpdate(factor_block);
+    rhs += residual * cp_v;
+    lhs += cp_v * cp_v;
+    // break;
   }
 
   // add "prediction" for the unobserved items
-  rhs += unobserved_weight * local_global_gramian * user_embedding;
+  rhs += unobserved_weight * local_gramian.dot(user_embedding);
   // add the regularization.
-  rhs += reg * local_user_embedding;
+  rhs += reg * user_emb_coeff;
 
-  Eigen::LLT<Eigen::MatrixXf, Eigen::Lower> cholesky(matrix);
-  assert(cholesky.info() == Eigen::Success);
-  new_value = local_user_embedding - cholesky.solve(rhs);
-
-  return new_value;
+  float new_local_user_emb = user_emb_coeff - rhs / lhs;
+  for (const auto& item_and_rating_index : user_history) {
+    prediction.coeffRef(item_and_rating_index.second) += (-rhs/lhs) * item_embeddings.coeff(item_and_rating_index.first, emb_index);
+  }
+  return new_local_user_emb;
 }
 
-class IALSppRecommender : public Recommender {
+class ICDRecommender : public Recommender {
  public:
-  IALSppRecommender(int embedding_dim, int num_users, int num_items, float reg,
-                  float reg_exp, float unobserved_weight, float stdev,
-                  int block_size)
+  ICDRecommender(int embedding_dim, int num_users, int num_items, float reg,
+                 float reg_exp, float unobserved_weight, float stdev)
       : user_embedding_(num_users, embedding_dim),
         item_embedding_(num_items, embedding_dim) {
     // Initialize embedding matrices
@@ -119,7 +99,6 @@ class IALSppRecommender : public Recommender {
     regularization_exp_ = reg_exp;
     embedding_dim_ = embedding_dim;
     unobserved_weight_ = unobserved_weight;
-    block_size_ = std::min(block_size, embedding_dim_);
   }
 
   VectorXf Score(const int user_id, const SpVector& user_history) override {
@@ -130,13 +109,11 @@ class IALSppRecommender : public Recommender {
   // iterative optimization algorithm.
   VectorXf EvaluateDataset(
       const Dataset& data, const SpMatrix& eval_by_user) override {
-    int num_epochs = 8;
-
     std::unordered_map<int, VectorXf> user_to_emb;
     VectorXf prediction(data.num_tuples());
 
     // Initialize the user and predictions to 0.0. (Note: this code needs to
-    // change if the embeddings would have biases).
+    //    change if the embeddings would have biases).
     for (const auto& user_and_history : data.by_user()) {
       user_to_emb[user_and_history.first] = VectorXf::Zero(embedding_dim_);
       for (const auto& item_and_rating_index : user_and_history.second) {
@@ -144,31 +121,13 @@ class IALSppRecommender : public Recommender {
       }
     }
 
-    // Train the user embeddings for num_epochs.
-    for (int e = 0; e < num_epochs; ++e) {
-      // Predict the dataset using the new user embeddings and the existing item
-      // embeddings.
-      for (const auto& user_and_history : data.by_user()) {
-        const VectorXf& user_emb = user_to_emb[user_and_history.first];
-        for (const auto& item_and_rating_index : user_and_history.second) {
-          prediction.coeffRef(item_and_rating_index.second) =
-              item_embedding_.row(item_and_rating_index.first).dot(user_emb);
-        }
-      }
-
-      // Optimize the user embeddings for each block.
-      for (int start = 0; start < embedding_dim_; start += block_size_) {
-        assert(start < embedding_dim_);
-        int end = std::min(start + block_size_, embedding_dim_);
-
-        Step(data.by_user(), start, end, &prediction,
-             [&](const int user_id) -> VectorXf& {
-               return user_to_emb[user_id];
-             },
-             item_embedding_,
-             /*index_of_item_bias=*/1);
-      }
-    }
+    // Reproject the users.
+    MergedStep(data.by_user(),
+         [&](const int user_id) -> VectorXf& {
+           return user_to_emb[user_id];
+         },
+         &prediction,
+         item_embedding_, /*index_of_item_bias=*/1);
 
     // Evalute the dataset.
     return EvaluateDatasetInternal(
@@ -179,6 +138,8 @@ class IALSppRecommender : public Recommender {
   }
 
   void Train(const Dataset& data) override {
+    auto prediction_start = std::chrono::steady_clock::now();
+
     // Predict the dataset.
     VectorXf prediction(data.num_tuples());
     for (const auto& user_and_history : data.by_user()) {
@@ -189,27 +150,41 @@ class IALSppRecommender : public Recommender {
       }
     }
 
-    for (int start = 0; start < embedding_dim_; start += block_size_) {
-      assert(start < embedding_dim_);
-      int end = std::min(start + block_size_, embedding_dim_);
+    auto prediction_end = std::chrono::steady_clock::now();
+    auto user_update_start = std::chrono::steady_clock::now();
 
-      Step(data.by_user(), start, end, &prediction,
-          [&](const int index) -> MatrixXf::RowXpr {
-            return user_embedding_.row(index);
-          },
-          item_embedding_,
-          /*index_of_item_bias=*/1);
-      ComputeLosses(data, prediction);
+    MergedStep(data.by_user(),
+              [&](const int index) -> MatrixXf::RowXpr {
+                return user_embedding_.row(index);
+                },
+              &prediction,
+              item_embedding_,
+              /*index_of_item_bias=*/1);
 
-      // Optimize the item embeddings
-      Step(data.by_item(), start, end, &prediction,
-          [&](const int index) -> MatrixXf::RowXpr {
-            return item_embedding_.row(index);
-          },
-          user_embedding_,
-          /*index_of_item_bias=*/0);
-      ComputeLosses(data, prediction);
-    }
+    auto user_update_end = std::chrono::steady_clock::now();
+    printf("User update: %d\n",
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        user_update_end- user_update_start));
+
+    ComputeLosses(data, prediction);
+
+    MergedStep(data.by_item(),
+              [&](const int index) -> MatrixXf::RowXpr {
+                return item_embedding_.row(index);
+                },
+              &prediction,
+              user_embedding_,
+              /*index_of_item_bias=*/1);
+
+    ComputeLosses(data, prediction);
+
+    auto als_step_end = std::chrono::steady_clock::now();
+
+    printf("Inner train: Prediction=%d\tStep=%d\n",
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        prediction_end - prediction_start),
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        als_step_end - prediction_end));
   }
 
   void ComputeLosses(const Dataset& data, const VectorXf& prediction) {
@@ -217,6 +192,7 @@ class IALSppRecommender : public Recommender {
       return;
     }
     auto time_start = std::chrono::steady_clock::now();
+
     int num_items = item_embedding_.rows();
     int num_users = user_embedding_.rows();
 
@@ -259,74 +235,68 @@ class IALSppRecommender : public Recommender {
               this->regularization_exp_);
   }
 
+
+  // Computes Step while traversing
   template <typename F>
-  void Step(const SpMatrix& data_by_user,
-            const int block_start,
-            const int block_end,
-            VectorXf* prediction,
-            F get_user_embedding_ref,
-            const MatrixXf& item_embedding,
-            const int index_of_item_bias) {
-    MatrixXf local_item_emb = item_embedding.block(
-        0, block_start, item_embedding.rows(), block_end-block_start);
+  void MergedStep(const SpMatrix& data_by_user,
+                  F get_user_embedding_ref,
+                  VectorXf* prediction,
+                  const MatrixXf& item_embedding,
+                  const int index_of_item_bias) {
 
-    // TODO: consider creating the local_gramian as a block from the
-    // local_global_gramian
-    MatrixXf local_gramian = local_item_emb.transpose() * local_item_emb;
-    MatrixXf local_global_gramian = local_item_emb.transpose() * item_embedding;
+    MatrixXf gramian = item_embedding.transpose() * item_embedding;
 
-    // Used for per user regularization.
     int num_items = item_embedding.rows();
 
     std::mutex m;
-    auto data_by_user_iter = data_by_user.begin();  // protected by m
-    int num_threads = std::thread::hardware_concurrency();
+    auto data_by_user_iter = data_by_user.begin();
+
+    int num_threads = std::atoi(std::getenv("OMP_NUM_THREADS"));
+
     std::vector<std::thread> threads;
     for (int i = 0; i < num_threads; ++i) {
-      threads.emplace_back(std::thread([&]{
+      threads.emplace_back(std::thread([&] {
         while (true) {
-          // Get a new user to work on.
           m.lock();
           if (data_by_user_iter == data_by_user.end()) {
             m.unlock();
             return;
           }
+
           int u = data_by_user_iter->first;
+          // printf("user_id: %d\n", u);
+          VectorXf old_user_emb = get_user_embedding_ref(u);
           SpVector train_history = data_by_user_iter->second;
           ++data_by_user_iter;
           m.unlock();
 
           assert(!train_history.empty());
           float reg = RegularizationValue(train_history.size(), num_items);
-          VectorXf old_user_emb = get_user_embedding_ref(u);
-          VectorXf old_local_user_emb = old_user_emb.segment(
-              block_start, block_end - block_start);
-          VectorXf new_local_user_emb = ProjectBlock(
-              train_history,
-              old_user_emb,
-              old_local_user_emb,
-              local_item_emb,
-              *prediction,
-              local_gramian,
-              local_global_gramian,
-              reg, this->unobserved_weight_);
-          // Update the ratings (without a lock)
-          VectorXf delta_local_user_emb =
-              new_local_user_emb - old_local_user_emb;
-          for (const auto& item_and_rating_index : train_history) {
-            prediction->coeffRef(item_and_rating_index.second) +=
-                delta_local_user_emb.dot(
-                    local_item_emb.row(item_and_rating_index.first));
-          }
-          // Update the user embedding.
+          // VectorXf new_user_emb(embedding_dim_);
+
+          for (int start = 0; start < embedding_dim_; ++start) {
+            VectorXf local_gramian = gramian.col(start);
+            // float new_local_user_emb = 0.9999;
+
+            float new_local_user_emb = ProjectScalar(
+                train_history,
+                old_user_emb,
+                item_embedding,
+                start,
+                *prediction,
+                local_gramian,
+                reg, this->unobserved_weight_);
+
+            old_user_emb[start] = new_local_user_emb;
+          } // after updating entire row
           m.lock();
-          get_user_embedding_ref(u).segment(
-              block_start, block_end - block_start) = new_local_user_emb;
+          get_user_embedding_ref(u) = old_user_emb
+          ;
           m.unlock();
         }
       }));
     }
-    // Join all threads.
+
     for (int i = 0; i < threads.size(); ++i) {
       threads[i].join();
     }
@@ -346,7 +316,6 @@ class IALSppRecommender : public Recommender {
   float regularization_exp_;
   int embedding_dim_;
   float unobserved_weight_;
-  int block_size_;
 
   bool print_trainstats_;
 };
@@ -361,7 +330,6 @@ int main(int argc, char* argv[]) {
   flags["regularization_exp"] = "1.0";
   flags["stddev"] = "0.1";
   flags["print_train_stats"] = "0";
-  flags["block_size"] = "128";
   flags["eval_during_training"] = "1";
 
   // Parse flags. This is a simple implementation to avoid external
@@ -392,16 +360,15 @@ int main(int argc, char* argv[]) {
 
   // Create the recommender.
   Recommender* recommender;
-  recommender = new IALSppRecommender(
+  recommender = new ICDRecommender(
     std::atoi(flags.at("embedding_dim").c_str()),
     train.max_user()+1,
     train.max_item()+1,
     std::atof(flags.at("regularization").c_str()),
     std::atof(flags.at("regularization_exp").c_str()),
     std::atof(flags.at("unobserved_weight").c_str()),
-    std::atof(flags.at("stddev").c_str()),
-    std::atoi(flags.at("block_size").c_str()));
-  ((IALSppRecommender*)recommender)->SetPrintTrainStats(
+    std::atof(flags.at("stddev").c_str()));
+  ((ICDRecommender*)recommender)->SetPrintTrainStats(
       std::atoi(flags.at("print_train_stats").c_str()));
 
   // Disable output buffer to see results without delay.
@@ -411,7 +378,7 @@ int main(int argc, char* argv[]) {
   auto evaluate = [&](int epoch) {
     Recommender::VectorXf metrics =
         recommender->EvaluateDataset(test_tr, test_te.by_user());
-    printf("Epoch %4d:\t Rec20=%.4f, Rec50=%.4f NDCG100=%.4f\n",
+    printf("Epoch %4d:\t Rec20\t%.4f Rec50\t%.4f NDCG100\t%.4f\n",
            epoch, metrics[0], metrics[1], metrics[2]);
   };
 
@@ -422,6 +389,7 @@ int main(int argc, char* argv[]) {
   if (eval_during_training) {
     evaluate(0);
   }
+  std::cout << "ICD -- num threads:" << std::atoi(std::getenv("OMP_NUM_THREADS")) << std::endl;
 
   // Train and evaluate.
   int num_epochs = std::atoi(flags.at("epochs").c_str());
@@ -434,7 +402,7 @@ int main(int argc, char* argv[]) {
       evaluate(epoch + 1);
     }
     auto time_eval_end = std::chrono::steady_clock::now();
-    printf("Timer: Train=%d\tEval=%d\n",
+    printf("Timer: Train\t%d\tEval\t%d\n",
            std::chrono::duration_cast<std::chrono::milliseconds>(
                time_train_end - time_train_start),
            std::chrono::duration_cast<std::chrono::milliseconds>(
